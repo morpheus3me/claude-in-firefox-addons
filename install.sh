@@ -16,10 +16,10 @@ if ! command -v node &> /dev/null; then
   exit 1
 fi
 
-# Install npm dependencies
+# Install npm dependencies exactly as pinned in package-lock.json
 if [ ! -d "$HOST_DIR/node_modules" ]; then
   echo "Installing npm dependencies..."
-  cd "$HOST_DIR" && npm install
+  cd "$HOST_DIR" && npm ci --ignore-scripts
   cd "$SCRIPT_DIR"
 fi
 

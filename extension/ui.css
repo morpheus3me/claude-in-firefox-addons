@@ -1,0 +1,94 @@
+:root {
+  --bg: #faf9f7;
+  --fg: #1f1e1d;
+  --muted: #6b6a68;
+  --card: #ffffff;
+  --border: #e3e1dc;
+  --accent: #c96442;
+  --accent-fg: #ffffff;
+  --warn-bg: #fdf1e7;
+  --warn-fg: #8a3b12;
+  --code-bg: #f1efea;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1f1e1d;
+    --fg: #f1efea;
+    --muted: #a8a6a1;
+    --card: #2a2927;
+    --border: #3d3b38;
+    --accent: #d97757;
+    --warn-bg: #3a2418;
+    --warn-fg: #f3b38f;
+    --code-bg: #34322f;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 20px;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", "Noto Sans TC", sans-serif;
+}
+
+h1 { font-size: 17px; margin: 0 0 4px; }
+h2 { font-size: 15px; margin: 24px 0 8px; }
+p { margin: 6px 0; }
+.muted { color: var(--muted); font-size: 13px; }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin: 12px 0;
+  overflow-wrap: anywhere;
+}
+
+.warn {
+  background: var(--warn-bg);
+  color: var(--warn-fg);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+  margin: 12px 0;
+}
+
+.host { font-weight: 600; font-size: 16px; }
+
+pre {
+  background: var(--code-bg);
+  border-radius: 6px;
+  padding: 8px;
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-size: 12px;
+  margin: 6px 0 0;
+}
+
+ul { margin: 6px 0; padding-left: 20px; }
+
+.buttons { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+
+button {
+  font: inherit;
+  border-radius: 8px;
+  padding: 7px 14px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--fg);
+  cursor: pointer;
+}
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
+button:disabled { opacity: 0.5; cursor: default; }
+
+label.toggle { display: flex; gap: 10px; align-items: flex-start; margin: 10px 0; cursor: pointer; }
+label.toggle input { margin-top: 3px; }
+
+.row { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--border); }
+.row:last-child { border-bottom: none; }

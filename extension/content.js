@@ -415,6 +415,40 @@
     };
   }
 
+  // --- Describe the element an action would hit (for high-risk detection) ---
+  function inspectTarget(msg) {
+    let el = null;
+    if (msg.ref) el = resolveRef(msg.ref);
+    else if (msg.active) el = document.activeElement;
+    else if (typeof msg.x === "number" && typeof msg.y === "number") el = document.elementFromPoint(msg.x, msg.y);
+    if (!el || el.nodeType !== 1) return null;
+
+    const target =
+      el.closest('button, a, input, select, textarea, summary, [role="button"], [role="link"], [role="menuitem"]') || el;
+    const field = findInputInside(target) || target;
+    const tag = field.tagName.toLowerCase();
+    const type = (field.type || "").toLowerCase();
+    const form = field.form || field.closest("form");
+    const fieldHints = `${field.getAttribute("autocomplete") || ""} ${field.name || ""} ${field.id || ""}`.toLowerCase();
+    const targetTag = target.tagName.toLowerCase();
+    const text = (getAccessibleName(target) || target.value || target.textContent || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .substring(0, 120);
+
+    return {
+      tag: targetTag,
+      type,
+      text,
+      inForm: !!form,
+      isSubmit:
+        (targetTag === "button" && (target.type || "submit").toLowerCase() === "submit" && !!form) ||
+        (targetTag === "input" && ["submit", "image"].includes((target.type || "").toLowerCase())),
+      isPassword: tag === "input" && type === "password",
+      isPayment: /\bcc-|card.?(number|no)|cardnumber|\bcvc\b|\bcvv\b|security.?code|\biban\b/.test(fieldHints),
+    };
+  }
+
   // --- Helper for synthetic events ---
   function sleep(ms) {
     return new Promise((r) => setTimeout(r, ms));
@@ -443,6 +477,11 @@
     if (msg.type === "setFormValue") {
       const result = setFormValue(msg.ref, msg.value);
       sendResponse({ result });
+      return true;
+    }
+
+    if (msg.type === "inspectTarget") {
+      sendResponse({ result: inspectTarget(msg) });
       return true;
     }
 

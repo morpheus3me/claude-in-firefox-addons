@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Claude MCP – Settings</title>
+  <link rel="stylesheet" href="ui.css">
+</head>
+<body>
+  <h1 id="title"></h1>
+  <p class="muted" id="intro"></p>
+
+  <h2 id="safetyHeading"></h2>
+  <div class="card" id="toggles"></div>
+  <div class="warn" id="offWarning" hidden></div>
+
+  <h2 id="alwaysHeading"></h2>
+  <div class="card" id="alwaysList"></div>
+
+  <h2 id="sessionHeading"></h2>
+  <div class="card">
+    <p class="muted" id="sessionText"></p>
+    <div class="buttons"><button id="clearSession"></button></div>
+  </div>
+
+  <script src="options.js"></script>
+</body>
+</html>
