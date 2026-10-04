@@ -1,21 +1,76 @@
-// Background service worker for Open Claude in Firefox extension.
-// Handles: native messaging, Firefox WebExtension APIs, tool dispatch, window management.
+// Background script for Open Claude in Firefox extension.
+// Handles: native messaging, Firefox WebExtension APIs, tool dispatch, window management,
+// and the safety layer (tab allowlist, per-site permissions, plan approval,
+// confirmation of high-risk actions).
 
 self.addEventListener("unhandledrejection", (event) => {
   event.preventDefault();
 });
 
 const NATIVE_HOST_NAME = "com.anthropic.open_claude_in_firefox";
-const MCP_WINDOW_STORAGE_KEY = "mcpWindowId";
+const PROMPT_TIMEOUT_MS = 120000;
+
+const DEFAULT_SETTINGS = {
+  requireSitePermission: true, // ask before Claude reads or acts on a site for the first time
+  requirePlanApproval: true, // update_plan opens an approval dialog
+  confirmHighRisk: true, // confirm purchases, submissions, deletions, credentials, JS execution
+};
+
+// Keys in storage.session (cleared when Firefox restarts, so stale tab/window
+// IDs can never be reused to adopt a tab the user opened) and storage.local.
+const S_WINDOW = "mcpWindowId";
+const S_TABS = "mcpTabIds";
+const S_SITE_HOSTS = "sessionSiteHosts"; // exact hosts allowed for this session
+const S_PLAN_DOMAINS = "sessionPlanDomains"; // domains (incl. subdomains) from approved plans
+const S_JS_HOSTS = "sessionJsHosts"; // hosts where javascript_tool is allowed this session
+const L_SETTINGS = "settings";
+const L_ALWAYS_HOSTS = "alwaysAllowedHosts";
 
 // --- State ---
 let nativePort = null;
 let mcpWindowId = null;
-const mcpTabs = new Set();
+const mcpTabs = new Set(); // tabs Claude may control: created by Claude, or opened by those tabs
 const consoleMessages = new Map(); // tabId -> [{level, text, timestamp, url}]
 const networkRequests = new Map(); // tabId -> [{url, method, status, type, timestamp, requestId}]
 const screenshotStore = new Map(); // imageId -> base64
 const consoleInterceptors = new Set(); // tabIds with interceptor installed
+
+// --- Storage helpers ---
+async function sessionGet(key, fallback) {
+  try {
+    const v = (await chrome.storage.session.get(key))[key];
+    return v === undefined ? fallback : v;
+  } catch {
+    return fallback;
+  }
+}
+
+async function sessionSet(key, value) {
+  try {
+    await chrome.storage.session.set({ [key]: value });
+  } catch {}
+}
+
+async function localGet(key, fallback) {
+  try {
+    const v = (await chrome.storage.local.get(key))[key];
+    return v === undefined ? fallback : v;
+  } catch {
+    return fallback;
+  }
+}
+
+async function getSettings() {
+  return { ...DEFAULT_SETTINGS, ...(await localGet(L_SETTINGS, {})) };
+}
+
+async function addToSessionList(key, value) {
+  const list = await sessionGet(key, []);
+  if (!list.includes(value)) {
+    list.push(value);
+    await sessionSet(key, list);
+  }
+}
 
 // --- Keep-alive alarm ---
 chrome.alarms.create("keepalive", { periodInMinutes: 0.4 });
@@ -38,7 +93,6 @@ function connectNativeHost() {
     });
 
     nativePort.onDisconnect.addListener(() => {
-      const err = chrome.runtime.lastError;
       nativePort = null;
       setTimeout(connectNativeHost, 2000);
     });
@@ -66,39 +120,262 @@ function sendError(id, error) {
   }
 }
 
-// --- MCP window management (replaces Chrome tab groups) ---
-async function saveMcpWindowId(id) {
-  try {
-    if (id === null) {
-      await chrome.storage.local.remove(MCP_WINDOW_STORAGE_KEY);
-    } else {
-      await chrome.storage.local.set({ [MCP_WINDOW_STORAGE_KEY]: id });
-    }
-  } catch {}
+function textResult(text) {
+  return { content: [{ type: "text", text }] };
 }
 
-async function ensureMcpWindow(createIfEmpty) {
+// --- User prompts (permission / plan / high-risk dialogs) ---
+// Each prompt opens confirm.html in its own popup window. Only that page, in
+// that window, may read the prompt or answer it.
+const pendingPrompts = new Map(); // promptId -> { data, resolve, timer, windowReady, windowId }
+const CONFIRM_URL = chrome.runtime.getURL("confirm.html");
+
+function finishPrompt(id, decision) {
+  const entry = pendingPrompts.get(id);
+  if (!entry) return;
+  pendingPrompts.delete(id);
+  clearTimeout(entry.timer);
+  if (entry.windowId != null) chrome.windows.remove(entry.windowId).catch(() => {});
+  entry.resolve(decision);
+}
+
+function askUser(data) {
+  const id = crypto.randomUUID();
+  return new Promise((resolve) => {
+    const entry = { data, resolve, windowId: null };
+    entry.timer = setTimeout(() => finishPrompt(id, "timeout"), PROMPT_TIMEOUT_MS);
+    entry.windowReady = chrome.windows
+      .create({ url: `${CONFIRM_URL}#${id}`, type: "popup", width: 480, height: 560, focused: true })
+      .then((win) => {
+        entry.windowId = win.id;
+        return win.id;
+      })
+      .catch(() => {
+        finishPrompt(id, "error");
+        return null;
+      });
+    pendingPrompts.set(id, entry);
+  });
+}
+
+chrome.windows.onRemoved.addListener((windowId) => {
+  for (const [id, entry] of pendingPrompts) {
+    if (entry.windowId === windowId) finishPrompt(id, "deny");
+  }
+  if (windowId === mcpWindowId) {
+    mcpWindowId = null;
+    sessionSet(S_WINDOW, null);
+  }
+});
+
+const PROMPT_DECISIONS = {
+  site: ["deny", "session", "always"],
+  plan: ["deny", "approve"],
+  action: ["deny", "once"],
+  javascript: ["deny", "once", "session"],
+};
+
+function isPromptSender(sender) {
+  return sender.id === chrome.runtime.id && typeof sender.url === "string" && sender.url.startsWith(CONFIRM_URL);
+}
+
+chrome.runtime.onMessage.addListener((msg, sender, reply) => {
+  if (msg?.type !== "prompt_get" && msg?.type !== "prompt_decision") return false;
+  const entry = pendingPrompts.get(msg.id);
+  if (!entry || !isPromptSender(sender)) {
+    reply({ error: "unknown prompt" });
+    return false;
+  }
+  entry.windowReady.then((windowId) => {
+    if (sender.tab && sender.tab.windowId !== windowId) {
+      reply({ error: "unknown prompt" });
+      return;
+    }
+    if (msg.type === "prompt_get") {
+      reply({ data: entry.data });
+    } else if (PROMPT_DECISIONS[entry.data.kind]?.includes(msg.decision)) {
+      reply({ ok: true });
+      finishPrompt(msg.id, msg.decision);
+    } else {
+      reply({ error: "invalid decision" });
+    }
+  });
+  return true;
+});
+
+// --- Site permissions ---
+function hostMatchesExact(host, entry) {
+  return host === entry || host === `www.${entry}` || `www.${host}` === entry;
+}
+
+function hostMatchesDomain(host, domain) {
+  return host === domain || host.endsWith(`.${domain}`);
+}
+
+// Pages without a site (blank tabs) need no permission; other non-web pages are off limits.
+function classifyUrl(urlStr) {
+  let url;
+  try {
+    url = new URL(urlStr || "about:blank");
+  } catch {
+    return { kind: "invalid" };
+  }
+  if (url.protocol === "http:" || url.protocol === "https:") return { kind: "web", host: url.hostname.toLowerCase() };
+  if (["about:blank", "about:newtab", "about:home"].includes(url.href)) return { kind: "blank" };
+  return { kind: "restricted", protocol: url.protocol };
+}
+
+async function isHostAllowed(host) {
+  const always = await localGet(L_ALWAYS_HOSTS, []);
+  if (always.some((e) => hostMatchesExact(host, e))) return true;
+  const sessionHosts = await sessionGet(S_SITE_HOSTS, []);
+  if (sessionHosts.some((e) => hostMatchesExact(host, e))) return true;
+  const planDomains = await sessionGet(S_PLAN_DOMAINS, []);
+  return planDomains.some((d) => hostMatchesDomain(host, d));
+}
+
+const sitePromptsInFlight = new Map(); // host -> Promise<decision>
+
+// Returns null if allowed, or a tool result explaining the refusal.
+async function ensureSiteAllowed(urlStr, purpose) {
+  const target = classifyUrl(urlStr);
+  if (target.kind === "blank") return null;
+  if (target.kind !== "web") {
+    return textResult(`Claude cannot ${purpose} on this page (${urlStr}). Only http(s) sites are supported.`);
+  }
+
+  const settings = await getSettings();
+  if (!settings.requireSitePermission) return null;
+  if (await isHostAllowed(target.host)) return null;
+
+  let pending = sitePromptsInFlight.get(target.host);
+  if (!pending) {
+    pending = askUser({ kind: "site", host: target.host, url: urlStr, purpose });
+    sitePromptsInFlight.set(target.host, pending);
+    pending.finally(() => sitePromptsInFlight.delete(target.host));
+  }
+  const decision = await pending;
+
+  if (decision === "always") {
+    const always = await localGet(L_ALWAYS_HOSTS, []);
+    if (!always.includes(target.host)) {
+      always.push(target.host);
+      await chrome.storage.local.set({ [L_ALWAYS_HOSTS]: always });
+    }
+    return null;
+  }
+  if (decision === "session") {
+    await addToSessionList(S_SITE_HOSTS, target.host);
+    return null;
+  }
+  const why = decision === "timeout" ? "did not respond to the permission request" : "declined permission";
+  return textResult(
+    `Permission denied: the user ${why} for ${target.host}. Do not retry or try to work around this; ask the user how they would like to proceed.`
+  );
+}
+
+// --- High-risk action detection ---
+const RISK_KEYWORDS =
+  /\b(buy|purchase|pay|checkout|check out|place order|order now|subscribe|unsubscribe|delete|remove|send|submit|confirm|transfer|withdraw|publish|share|sign up|register|book now|donate|accept|agree)\b|購買|購物車結帳|結帳|付款|支付|下單|訂購|訂閱|刪除|移除|送出|傳送|發送|提交|確認|轉帳|匯款|提款|發布|發佈|發表|分享|註冊|捐款|同意/i;
+
+function describeRisk(action, info) {
+  if (!info) return null;
+  const label = info.text ? `"${info.text}"` : `<${info.tag}>`;
+  if (action === "click") {
+    if (info.isSubmit) return `Submit a form by clicking ${label}`;
+    if (info.text && RISK_KEYWORDS.test(info.text)) return `Click ${label}`;
+    return null;
+  }
+  if (action === "enter") {
+    if (info.isSubmit || (info.inForm && info.tag === "input")) return `Press Enter to submit a form (focused: ${label})`;
+    if (info.text && RISK_KEYWORDS.test(info.text) && ["button", "a"].includes(info.tag)) return `Press Enter on ${label}`;
+    return null;
+  }
+  if (action === "input") {
+    if (info.isPassword) return `Enter text into a password field (${label})`;
+    if (info.isPayment) return `Enter text into a payment field (${label})`;
+    return null;
+  }
+  return null;
+}
+
+// Returns null if the action may proceed, or a tool result if the user declined.
+async function confirmIfHighRisk(tab, action, inspectMsg, summary) {
+  const settings = await getSettings();
+  if (!settings.confirmHighRisk) return null;
+  let info = null;
+  try {
+    info = (await sendContentMessage(tab.id, { type: "inspectTarget", ...inspectMsg }))?.result;
+  } catch {}
+  const risk = describeRisk(action, info);
+  if (!risk) return null;
+  const decision = await askUser({
+    kind: "action",
+    host: classifyUrl(tab.url).host || "",
+    url: tab.url,
+    title: tab.title || "",
+    description: risk,
+    detail: summary,
+  });
+  if (decision === "once") return null;
+  return textResult(
+    `The user did not approve this high-risk action (${risk}). It was not performed. Do not retry; ask the user how to proceed.`
+  );
+}
+
+// --- MCP tabs: only tabs Claude created (or that they opened) can be controlled ---
+async function saveMcpTabs() {
+  await sessionSet(S_TABS, [...mcpTabs]);
+}
+
+function addMcpTab(tabId) {
+  mcpTabs.add(tabId);
+  saveMcpTabs();
+}
+
+async function pruneMcpTabs() {
+  for (const id of [...mcpTabs]) {
+    try {
+      await chrome.tabs.get(id);
+    } catch {
+      mcpTabs.delete(id);
+    }
+  }
+  await saveMcpTabs();
+}
+
+async function createMcpTab() {
   if (mcpWindowId !== null) {
     try {
       await chrome.windows.get(mcpWindowId);
-      const tabs = await chrome.tabs.query({ windowId: mcpWindowId });
-      mcpTabs.clear();
-      tabs.forEach((t) => mcpTabs.add(t.id));
-      if (tabs.length > 0) return;
+      const tab = await chrome.tabs.create({ windowId: mcpWindowId, url: "about:blank", active: true });
+      addMcpTab(tab.id);
+      return tab;
     } catch {
       mcpWindowId = null;
-      mcpTabs.clear();
-      await saveMcpWindowId(null);
     }
   }
-
-  if (!createIfEmpty) return;
-
   const win = await chrome.windows.create({ focused: true, url: "about:blank" });
   mcpWindowId = win.id;
-  mcpTabs.clear();
+  await sessionSet(S_WINDOW, mcpWindowId);
   win.tabs.forEach((t) => mcpTabs.add(t.id));
-  await saveMcpWindowId(mcpWindowId);
+  await saveMcpTabs();
+  return win.tabs[0];
+}
+
+async function ensureMcpTabs(createIfEmpty) {
+  await pruneMcpTabs();
+  if (mcpTabs.size === 0 && createIfEmpty) await createMcpTab();
+}
+
+async function getMcpTabList() {
+  const tabs = [];
+  for (const id of mcpTabs) {
+    try {
+      tabs.push(await chrome.tabs.get(id));
+    } catch {}
+  }
+  return tabs;
 }
 
 function formatTabContext(tabs) {
@@ -124,27 +401,47 @@ function formatTabContext(tabs) {
 }
 
 async function isInGroup(tabId) {
-  if (mcpWindowId === null) return false;
+  if (!mcpTabs.has(tabId)) return false;
   try {
-    const tab = await chrome.tabs.get(tabId);
-    return tab.windowId === mcpWindowId;
+    await chrome.tabs.get(tabId);
+    return true;
   } catch {
     return false;
   }
 }
 
+// Returns { tab } if Claude may work in this tab, or { denied: toolResult }.
+async function guardTab(tabId, purpose) {
+  if (!(await isInGroup(tabId))) {
+    return {
+      denied: textResult(
+        `Tab ${tabId} is not one of Claude's tabs. Use tabs_context_mcp / tabs_create_mcp to get a tab Claude created.`
+      ),
+    };
+  }
+  const tab = await chrome.tabs.get(tabId);
+  const denied = await ensureSiteAllowed(tab.url, purpose);
+  return denied ? { denied } : { tab };
+}
+
+// Tabs opened by Claude's tabs (links with target=_blank, popups) join the
+// allowlist, like Chrome tab groups. They still need site permission.
+chrome.tabs.onCreated.addListener((tab) => {
+  if (tab.openerTabId !== undefined && mcpTabs.has(tab.openerTabId)) addMcpTab(tab.id);
+});
+
 // Clean up when tab is closed
 chrome.tabs.onRemoved.addListener((tabId) => {
-  mcpTabs.delete(tabId);
+  if (mcpTabs.delete(tabId)) saveMcpTabs();
   consoleMessages.delete(tabId);
   networkRequests.delete(tabId);
   consoleInterceptors.delete(tabId);
 });
 
-// --- Network monitoring via webRequest ---
+// --- Network monitoring via webRequest (Claude's tabs only) ---
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
-    if (details.tabId < 0) return;
+    if (!mcpTabs.has(details.tabId)) return;
     const reqs = networkRequests.get(details.tabId) || [];
     reqs.push({
       url: details.url,
@@ -162,7 +459,7 @@ chrome.webRequest.onBeforeRequest.addListener(
 
 chrome.webRequest.onCompleted.addListener(
   (details) => {
-    if (details.tabId < 0) return;
+    if (!mcpTabs.has(details.tabId)) return;
     const reqs = networkRequests.get(details.tabId) || [];
     for (let i = reqs.length - 1; i >= 0; i--) {
       if (reqs[i].requestId === details.requestId) {
@@ -182,7 +479,7 @@ chrome.webRequest.onCompleted.addListener(
 
 chrome.webRequest.onErrorOccurred.addListener(
   (details) => {
-    if (details.tabId < 0) return;
+    if (!mcpTabs.has(details.tabId)) return;
     const reqs = networkRequests.get(details.tabId) || [];
     for (let i = reqs.length - 1; i >= 0; i--) {
       if (reqs[i].requestId === details.requestId) {
@@ -341,25 +638,56 @@ async function ensureConsoleInterceptor(tabId) {
   } catch {}
 }
 
+// Normalizes a plan domain like "https://www.GitHub.com/foo" to "github.com".
+// Returns null for anything that is not a plain hostname.
+function normalizeDomain(input) {
+  let d = String(input || "").trim().toLowerCase();
+  d = d.replace(/^[a-z][a-z0-9+.-]*:\/\//, "").replace(/[/?#].*$/, "").replace(/:\d+$/, "");
+  d = d.replace(/^\*\./, "").replace(/^www\./, "").replace(/\.$/, "");
+  if (d === "localhost") return d;
+  if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(d)) return null;
+  return d;
+}
+
+// javascript_tool can do anything the page can, so it is always treated as
+// high risk. The user may allow it for the rest of the session on one site.
+async function confirmJavascript(tab, code) {
+  const settings = await getSettings();
+  if (!settings.confirmHighRisk) return null;
+  const host = classifyUrl(tab.url).host || "";
+  if ((await sessionGet(S_JS_HOSTS, [])).includes(host)) return null;
+  const decision = await askUser({
+    kind: "javascript",
+    host,
+    url: tab.url,
+    title: tab.title || "",
+    description: "Run JavaScript in the page",
+    detail: code.length > 2000 ? code.slice(0, 2000) + "\n…" : code,
+  });
+  if (decision === "session") {
+    await addToSessionList(S_JS_HOSTS, host);
+    return null;
+  }
+  if (decision === "once") return null;
+  return textResult(
+    `The user did not approve running JavaScript on ${host}. It was not executed. Do not retry; ask the user how to proceed.`
+  );
+}
+
 // --- Tool handlers ---
 const toolHandlers = {
   async tabs_context_mcp(args) {
-    await ensureMcpWindow(args.createIfEmpty);
-    if (mcpWindowId === null) {
-      return {
-        content: [{ type: "text", text: "No MCP window exists. Use createIfEmpty: true to create one." }],
-      };
+    await ensureMcpTabs(args.createIfEmpty);
+    if (mcpTabs.size === 0) {
+      return textResult("No MCP tabs exist. Use createIfEmpty: true to create one.");
     }
-    const tabs = await chrome.tabs.query({ windowId: mcpWindowId });
-    return formatTabContext(tabs);
+    return formatTabContext(await getMcpTabList());
   },
 
   async tabs_create_mcp(args) {
-    await ensureMcpWindow(true);
-    const tab = await chrome.tabs.create({ windowId: mcpWindowId, active: true });
-    mcpTabs.add(tab.id);
-    const tabs = await chrome.tabs.query({ windowId: mcpWindowId });
-    const result = formatTabContext(tabs);
+    await pruneMcpTabs();
+    const tab = await createMcpTab();
+    const result = formatTabContext(await getMcpTabList());
     result.content[0].text = `Created new tab. Tab ID: ${tab.id}\n\n` + result.content[0].text;
     return result;
   },
@@ -367,21 +695,19 @@ const toolHandlers = {
   async navigate(args) {
     const { url, tabId } = args;
     if (!(await isInGroup(tabId)))
-      return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP window.` }] };
+      return textResult(`Tab ${tabId} is not one of Claude's tabs. Use tabs_context_mcp / tabs_create_mcp first.`);
 
     if (url === "back") {
       await chrome.tabs.goBack(tabId);
     } else if (url === "forward") {
       await chrome.tabs.goForward(tabId);
     } else {
-      let targetUrl = url;
-      if (
-        !targetUrl.match(/^https?:\/\//i) &&
-        !targetUrl.startsWith("about:") &&
-        !targetUrl.startsWith("moz-extension:") &&
-        !targetUrl.startsWith("javascript:")
-      ) {
-        targetUrl = targetUrl.replace(/^[a-z]{1,5}:\/+/i, "");
+      let targetUrl = String(url).trim();
+      if (!/^https?:\/\//i.test(targetUrl) && targetUrl !== "about:blank") {
+        // Only http(s) is allowed: reject javascript:, data:, file:, about:, moz-extension:, etc.
+        if (/^[a-z][a-z0-9+.-]*:\/\//i.test(targetUrl) || /^(javascript|data|file|about|blob|moz-extension|view-source|chrome|resource):/i.test(targetUrl)) {
+          return textResult(`Unsupported URL scheme in "${url}". Only http and https URLs can be opened.`);
+        }
         targetUrl = "https://" + targetUrl;
       }
       try {
@@ -389,6 +715,8 @@ const toolHandlers = {
       } catch {
         return { content: [{ type: "text", text: `Invalid URL: "${url}". Could not parse as a valid URL.` }] };
       }
+      const denied = await ensureSiteAllowed(targetUrl, "open this site");
+      if (denied) return denied;
       await chrome.tabs.update(tabId, { url: targetUrl });
       // Console interceptor needs re-install after navigation
       consoleInterceptors.delete(tabId);
@@ -409,10 +737,7 @@ const toolHandlers = {
     });
 
     const tab = await chrome.tabs.get(tabId);
-    let tabs = [];
-    if (mcpWindowId !== null) {
-      tabs = await chrome.tabs.query({ windowId: mcpWindowId });
-    }
+    const tabs = await getMcpTabList();
     const loading = tab.status !== "complete" ? " (still loading)" : "";
     const text =
       `Navigated to ${tab.url}${loading}.\n## Pages\n` +
@@ -423,8 +748,16 @@ const toolHandlers = {
 
   async computer(args) {
     const { action, tabId } = args;
-    if (!(await isInGroup(tabId)))
-      return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP window.` }] };
+    if (action === "wait") {
+      // Touches no page content, so only tab membership matters.
+      if (!(await isInGroup(tabId))) return textResult(`Tab ${tabId} is not one of Claude's tabs.`);
+      const duration = Math.min(args.duration || 1, 30);
+      await sleep(duration * 1000);
+      return textResult(`Waited for ${duration} second${duration !== 1 ? "s" : ""}`);
+    }
+    const guard = await guardTab(tabId, action === "screenshot" || action === "zoom" ? "view this site" : "interact with this site");
+    if (guard.denied) return guard.denied;
+    const tab = guard.tab;
 
     let coordinate = args.coordinate;
     if (args.ref && !coordinate) {
@@ -459,6 +792,10 @@ const toolHandlers = {
       case "left_click": {
         if (!coordinate)
           return { content: [{ type: "text", text: "coordinate is required for left_click" }] };
+        {
+          const declined = await confirmIfHighRisk(tab, "click", { x: coordinate[0], y: coordinate[1] }, `left_click at (${coordinate[0]}, ${coordinate[1]})`);
+          if (declined) return declined;
+        }
         await sendContentMessage(tabId, {
           type: "dispatchMouseClick",
           x: coordinate[0], y: coordinate[1],
@@ -481,6 +818,10 @@ const toolHandlers = {
       case "double_click": {
         if (!coordinate)
           return { content: [{ type: "text", text: "coordinate is required for double_click" }] };
+        {
+          const declined = await confirmIfHighRisk(tab, "click", { x: coordinate[0], y: coordinate[1] }, `double_click at (${coordinate[0]}, ${coordinate[1]})`);
+          if (declined) return declined;
+        }
         await sendContentMessage(tabId, {
           type: "dispatchMouseClick",
           x: coordinate[0], y: coordinate[1],
@@ -492,6 +833,10 @@ const toolHandlers = {
       case "triple_click": {
         if (!coordinate)
           return { content: [{ type: "text", text: "coordinate is required for triple_click" }] };
+        {
+          const declined = await confirmIfHighRisk(tab, "click", { x: coordinate[0], y: coordinate[1] }, `triple_click at (${coordinate[0]}, ${coordinate[1]})`);
+          if (declined) return declined;
+        }
         await sendContentMessage(tabId, {
           type: "dispatchMouseClick",
           x: coordinate[0], y: coordinate[1],
@@ -514,6 +859,10 @@ const toolHandlers = {
       case "type": {
         if (!args.text)
           return { content: [{ type: "text", text: "text is required for type action" }] };
+        {
+          const declined = await confirmIfHighRisk(tab, "input", { active: true }, `type ${args.text.length} characters`);
+          if (declined) return declined;
+        }
         for (const char of args.text) {
           await sendContentMessage(tabId, { type: "insertText", text: char });
           await sleep(10);
@@ -530,6 +879,10 @@ const toolHandlers = {
           return { content: [{ type: "text", text: "text is required for key action" }] };
         const repeat = Math.min(args.repeat || 1, 100);
         const keys = args.text.split(" ").filter(Boolean);
+        if (keys.some((k) => parseKeyCombo(k).key === "Enter")) {
+          const declined = await confirmIfHighRisk(tab, "enter", { active: true }, `press keys: ${args.text}`);
+          if (declined) return declined;
+        }
         for (let r = 0; r < repeat; r++) {
           for (const keyStr of keys) {
             const { key, modifiers: keyMod } = parseKeyCombo(keyStr);
@@ -631,8 +984,8 @@ const toolHandlers = {
 
   async read_page(args) {
     const { tabId } = args;
-    if (!(await isInGroup(tabId)))
-      return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP window.` }] };
+    const guard = await guardTab(tabId, "read this site");
+    if (guard.denied) return guard.denied;
 
     const resp = await sendContentMessage(tabId, {
       type: "generateAccessibilityTree",
@@ -658,8 +1011,8 @@ const toolHandlers = {
 
   async get_page_text(args) {
     const { tabId } = args;
-    if (!(await isInGroup(tabId)))
-      return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP window.` }] };
+    const guard = await guardTab(tabId, "read this site");
+    if (guard.denied) return guard.denied;
 
     const resp = await sendContentMessage(tabId, { type: "getPageText" });
     if (!resp?.result)
@@ -682,8 +1035,8 @@ const toolHandlers = {
 
   async find(args) {
     const { query, tabId } = args;
-    if (!(await isInGroup(tabId)))
-      return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP window.` }] };
+    const guard = await guardTab(tabId, "read this site");
+    if (guard.denied) return guard.denied;
 
     const resp = await sendContentMessage(tabId, { type: "findElements", query });
     const results = resp?.result || [];
@@ -702,8 +1055,11 @@ const toolHandlers = {
 
   async form_input(args) {
     const { ref, value, tabId } = args;
-    if (!(await isInGroup(tabId)))
-      return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP window.` }] };
+    const guard = await guardTab(tabId, "interact with this site");
+    if (guard.denied) return guard.denied;
+
+    const declined = await confirmIfHighRisk(guard.tab, "input", { ref }, `set ${ref} via form_input`);
+    if (declined) return declined;
 
     const resp = await sendContentMessage(tabId, { type: "setFormValue", ref, value });
     const result = resp?.result;
@@ -714,8 +1070,11 @@ const toolHandlers = {
 
   async javascript_tool(args) {
     const { text, tabId } = args;
-    if (!(await isInGroup(tabId)))
-      return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP window.` }] };
+    const guard = await guardTab(tabId, "run JavaScript on this site");
+    if (guard.denied) return guard.denied;
+
+    const declined = await confirmJavascript(guard.tab, text);
+    if (declined) return declined;
 
     try {
       const results = await chrome.scripting.executeScript({
@@ -758,8 +1117,8 @@ const toolHandlers = {
 
   async read_console_messages(args) {
     const { tabId, pattern, limit = 100, onlyErrors, clear } = args;
-    if (!(await isInGroup(tabId)))
-      return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP window.` }] };
+    const guard = await guardTab(tabId, "read this site's console");
+    if (guard.denied) return guard.denied;
 
     await ensureConsoleInterceptor(tabId);
 
@@ -809,8 +1168,8 @@ const toolHandlers = {
 
   async read_network_requests(args) {
     const { tabId, urlPattern, limit = 100, clear } = args;
-    if (!(await isInGroup(tabId)))
-      return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP window.` }] };
+    const guard = await guardTab(tabId, "read this site's network activity");
+    if (guard.denied) return guard.denied;
 
     let reqs = networkRequests.get(tabId) || [];
 
@@ -841,7 +1200,7 @@ const toolHandlers = {
   async resize_window(args) {
     const { width, height, tabId } = args;
     if (!(await isInGroup(tabId)))
-      return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP window.` }] };
+      return textResult(`Tab ${tabId} is not one of Claude's tabs.`);
 
     const tab = await chrome.tabs.get(tabId);
     await chrome.windows.update(tab.windowId, { width, height });
@@ -883,19 +1242,46 @@ const toolHandlers = {
   },
 
   async update_plan(args) {
-    const { domains, approach } = args;
-    let text = `Plan:\n\nDomains: ${domains.join(", ")}\n\nApproach:\n`;
-    for (const step of approach) {
-      text += `- ${step}\n`;
+    const approach = Array.isArray(args.approach) ? args.approach.map(String) : [];
+    const domains = [];
+    const invalid = [];
+    for (const d of Array.isArray(args.domains) ? args.domains : []) {
+      const n = normalizeDomain(d);
+      if (n) {
+        if (!domains.includes(n)) domains.push(n);
+      } else {
+        invalid.push(String(d));
+      }
     }
-    text += "\nPlan auto-approved (no permission restrictions in this extension).";
-    return { content: [{ type: "text", text }] };
+
+    const settings = await getSettings();
+    if (!settings.requirePlanApproval) {
+      return textResult(
+        "Plan noted (plan approval is disabled in settings). " +
+          (settings.requireSitePermission
+            ? "Each site will still ask the user for permission the first time Claude uses it."
+            : "Site permissions are disabled, so no further approval is needed.")
+      );
+    }
+
+    const decision = await askUser({ kind: "plan", domains, invalid, approach });
+    if (decision !== "approve") {
+      return textResult(
+        "The user did not approve this plan. Do not proceed with it; ask the user what they would like to change."
+      );
+    }
+    for (const d of domains) await addToSessionList(S_PLAN_DOMAINS, d);
+    let text = `Plan approved by the user. Approved domains (including subdomains) for this session: ${domains.join(", ") || "(none)"}.`;
+    if (invalid.length) text += ` Ignored invalid domain entries: ${invalid.join(", ")}.`;
+    text += " Other sites will ask for permission when first used. High-risk actions still require confirmation.";
+    return textResult(text);
   },
 };
 
 // --- Tool dispatch ---
 async function handleToolRequest(id, tool, args) {
-  const handler = toolHandlers[tool];
+  await initialized;
+  const handler = Object.hasOwn(toolHandlers, tool) ? toolHandlers[tool] : null;
   if (!handler) {
     sendError(id, `Unknown tool: ${tool}`);
     return;
@@ -911,23 +1297,21 @@ async function handleToolRequest(id, tool, args) {
 
 // --- Init ---
 
-// Recover MCP window state after service worker restart
-async function recoverMcpWindowState() {
-  try {
-    const stored = await chrome.storage.local.get(MCP_WINDOW_STORAGE_KEY);
-    const savedId = stored[MCP_WINDOW_STORAGE_KEY];
-    if (savedId) {
-      try {
-        await chrome.windows.get(savedId);
-        mcpWindowId = savedId;
-        const tabs = await chrome.tabs.query({ windowId: mcpWindowId });
-        tabs.forEach((t) => mcpTabs.add(t.id));
-      } catch {
-        await chrome.storage.local.remove(MCP_WINDOW_STORAGE_KEY);
-      }
+// Recover Claude's tabs after the background script restarts. Session storage
+// is cleared when Firefox restarts, so IDs from a previous run are never reused.
+async function recoverMcpState() {
+  mcpWindowId = await sessionGet(S_WINDOW, null);
+  if (mcpWindowId !== null) {
+    try {
+      await chrome.windows.get(mcpWindowId);
+    } catch {
+      mcpWindowId = null;
+      await sessionSet(S_WINDOW, null);
     }
-  } catch {}
+  }
+  for (const id of await sessionGet(S_TABS, [])) mcpTabs.add(id);
+  await pruneMcpTabs();
 }
 
-recoverMcpWindowState();
+const initialized = recoverMcpState().catch(() => {});
 connectNativeHost();

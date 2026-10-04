@@ -27,6 +27,7 @@ This is a Firefox port of [open-claude-in-chrome](https://github.com/noemica-io/
 | | Claude in Chrome (official) | Open Claude in Firefox |
 |---|---|---|
 | **Domain blocklist** | 58 blocked domains across 11 categories | No blocklist. Navigate anywhere. |
+| **Safety prompts** | Per-site permission, plan approval, high-risk confirmation | Same model, on by default, each switchable in Settings ([details](#security-model)) |
 | **Browser** | Chrome and Edge only | Firefox |
 | **Source code** | Closed source | Open source (MIT) |
 | **Tools** | 18 MCP tools | Same 18 MCP tools |
@@ -48,7 +49,7 @@ This is a Firefox port of [open-claude-in-chrome](https://github.com/noemica-io/
 | News/Media | NYT, WSJ, Barron's, MarketWatch, Bloomberg, Reuters, Economist, Wired, Vogue |
 | Social Media | Reddit |
 
-Open Claude in Firefox has **none of these restrictions**.
+Open Claude in Firefox has **none of these restrictions**. It does keep the official extension's *consent* model: Claude asks before using a new site and before high-risk actions. See [Security model](#security-model).
 
 ## Architecture
 
@@ -61,19 +62,39 @@ Three components:
 2. **MCP Server** — Node.js process started by Claude Code or Claude Desktop, exposes tools via MCP
 3. **Native Messaging Host** — Bridge between the MCP server and the extension
 
+The TCP link listens on `127.0.0.1` only, and every connection must authenticate (see [Security model](#security-model)).
+
+## Security model
+
+This follows the official Claude in Chrome safety design, minus the domain blocklist. All protections are **on by default**; each can be turned off in the extension's Settings page (`about:addons` → Claude MCP → Preferences).
+
+| Protection | What it does |
+|---|---|
+| **Site permissions** | The first time Claude opens, reads, or acts on a site, a dialog asks you to **Deny**, **Allow for this session**, or **Always allow this site**. Approvals are per exact host (`www.` is treated as the same host). Session approvals are cleared when Firefox restarts; always-allowed sites can be removed in Settings. |
+| **Plan approval** | `update_plan` opens a dialog listing the domains and approach. Approving it allows those domains *and their subdomains* for the session. Rejecting it tells Claude to stop and ask you. |
+| **High-risk confirmation** | Before Claude clicks something that submits a form or looks like buy / pay / checkout / delete / send / confirm / transfer / publish / share (English and Chinese keywords), presses Enter in a form, or types into a password or payment field, you're asked to **Allow once** or **Deny**. `javascript_tool` always asks (with an option to allow it on that site for the session). |
+| **Claude's tabs only** | Claude can only control tabs it created, plus tabs those tabs open (links, popups), like Chrome tab groups. Tabs you open or drag into the MCP window are off limits. Tab and window IDs live in session storage, so a restart never hands Claude one of your tabs. |
+| **Network log scope** | `read_network_requests` data is only collected for Claude's tabs. |
+| **http(s) only** | `navigate` refuses `javascript:`, `data:`, `file:`, `about:`, `moz-extension:` and other non-web URLs. |
+| **Authenticated local channel** | A random secret is created at `~/.config/open-claude-in-firefox/auth-token` (mode `0600`). The MCP server, client MCP servers, and the native host prove they know it with an HMAC challenge-response **in both directions**, so other local users or programs can't drive your browser through the TCP port, and a program squatting on the port can't impersonate the MCP server. The secret is never sent over the socket. |
+
+Dialogs that get no answer within 2 minutes count as **Deny**, and so does closing the dialog.
+
+High-risk detection is heuristic (it looks at the element being clicked or typed into), so it can't catch everything. Prompt injection, where a web page hides instructions aimed at Claude, is still the main risk of any browser agent. Consider using a dedicated Firefox profile that isn't signed in to your most sensitive accounts.
+
 ## Installation
 
 ### Prerequisites
 
 - **Node.js** v18+
-- **Firefox** 109+
+- **Firefox** 115+
 - **Claude Code** v2.0.73+ and/or **Claude Desktop**
 
 ### Step 1: Install dependencies
 
 ```bash
 cd host
-npm install
+npm ci --ignore-scripts
 cd ..
 ```
 
@@ -201,13 +222,13 @@ All 18 tools, matching the Claude in Chrome interface:
 | `shortcuts_list` | List shortcuts (stub) |
 | `shortcuts_execute` | Run shortcut (stub) |
 | `switch_browser` | Switch browser (stub) |
-| `update_plan` | Present plan (auto-approved) |
+| `update_plan` | Present plan for user approval |
 
 ## Firefox Notes
 
 ### Tab groups → MCP window
 
-The Chrome version uses tab groups to track Claude's tabs. Firefox has no tab groups API, so this extension instead opens a dedicated **MCP window**. All tabs Claude creates live in that window. The window ID is saved to extension storage and recovered automatically after Firefox restarts or the service worker is reloaded.
+The Chrome version uses tab groups to track Claude's tabs. Firefox has no tab groups API, so this extension instead opens a dedicated **MCP window**. All tabs Claude creates live in that window. Claude can only control the tabs it created (and tabs they open), not every tab in the window. These IDs are kept in `storage.session`, so they survive a background-script reload but are cleared when Firefox restarts.
 
 ### Synthetic events
 
@@ -234,6 +255,7 @@ No build step. All files are plain JavaScript. After pulling or editing:
 | `host/mcp-server.js` | Kill stale servers and reconnect: `pkill -f "node.*mcp-server"` then `/mcp` in Claude Code |
 | `host/native-host.js` | Restart Firefox (close all windows, reopen) |
 | `install.sh` or native host name changed | Re-run `./install.sh`, restart Firefox, re-add MCP |
+| `host/auth.js` (channel authentication) | Restart Firefox **and** kill/reconnect MCP servers. All three processes must run the same version or connections are rejected. |
 
 ### Quick reset
 
@@ -300,6 +322,19 @@ pkill -f "node.*mcp-server"
 ```
 
 Then `/mcp` in Claude Code to reconnect.
+
+### "failed authentication" / "Rejected unauthenticated TCP connection"
+
+The MCP server and native host must run the same version and read the same secret.
+1. Make sure both run as the same OS user (they read `~/.config/open-claude-in-firefox/auth-token`)
+2. Kill old servers (`pkill -f "node.*mcp-server"`), restart Firefox, and reconnect with `/mcp`
+3. If it persists, another program may be using the port. Check with `lsof -i :18765` and/or change the port (below)
+
+To rotate the secret, delete `auth-token`, then restart Firefox and the MCP servers.
+
+### Permission dialog didn't appear
+
+Dialogs open as small popup windows. Check whether one is hidden behind other windows. Unanswered dialogs are denied after 2 minutes, and Claude is told not to retry.
 
 ### Port conflict
 

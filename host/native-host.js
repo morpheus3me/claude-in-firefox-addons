@@ -9,6 +9,7 @@ import net from "node:net";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { loadOrCreateToken, clientHandshake } from "./auth.js";
 
 const DEFAULT_PORT = 18765;
 
@@ -57,61 +58,93 @@ function writeNativeMessage(obj) {
 // --- TCP connection to MCP server ---
 
 let tcpSocket = null;
-let tcpBuffer = Buffer.alloc(0);
+let tcpReady = false; // true only after the MCP server has authenticated itself
 let reconnectTimer = null;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 60; // 30 seconds at 500ms intervals
+const MAX_LINE_BYTES = 64 * 1024 * 1024;
 const TCP_PORT = getPort();
+
+let AUTH_TOKEN;
+try {
+  AUTH_TOKEN = loadOrCreateToken();
+} catch (e) {
+  process.stderr.write(`open-claude-in-firefox native host: cannot load auth token: ${e.message}\n`);
+  process.exit(1);
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  reconnectTimer = setInterval(() => {
+    reconnectAttempts++;
+    if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+      // MCP server is gone — exit cleanly so we don't linger as a zombie
+      clearInterval(reconnectTimer);
+      process.exit(0);
+    }
+    if (!tcpSocket) connectTcp();
+  }, 500);
+}
 
 function connectTcp() {
   if (tcpSocket) return;
 
-  tcpSocket = new net.Socket();
+  const socket = new net.Socket();
+  tcpSocket = socket;
+  tcpReady = false;
 
-  tcpSocket.connect(TCP_PORT, "127.0.0.1", () => {
-    reconnectAttempts = 0;
-    if (reconnectTimer) {
-      clearInterval(reconnectTimer);
-      reconnectTimer = null;
-    }
+  socket.connect(TCP_PORT, "127.0.0.1", () => {
+    clientHandshake(socket, AUTH_TOKEN, "native", (err, rest) => {
+      if (err) {
+        process.stderr.write(`open-claude-in-firefox native host: ${err.message}\n`);
+        socket.destroy();
+        return;
+      }
+      reconnectAttempts = 0;
+      if (reconnectTimer) {
+        clearInterval(reconnectTimer);
+        reconnectTimer = null;
+      }
+      tcpReady = true;
+      startForwarding(socket, rest);
+    });
   });
 
-  tcpSocket.on("data", (chunk) => {
-    // newline-delimited JSON from MCP server
-    tcpBuffer = Buffer.concat([tcpBuffer, chunk]);
+  socket.on("error", () => {});
+
+  socket.on("close", () => {
+    if (tcpSocket === socket) {
+      tcpSocket = null;
+      tcpReady = false;
+    }
+    scheduleReconnect();
+  });
+}
+
+// Forward newline-delimited JSON from the (authenticated) MCP server to the extension.
+function startForwarding(socket, initial) {
+  let tcpBuffer = initial;
+
+  const drain = () => {
     let newlineIdx;
     while ((newlineIdx = tcpBuffer.indexOf(10)) !== -1) {
       const line = tcpBuffer.subarray(0, newlineIdx).toString("utf-8").trim();
       tcpBuffer = tcpBuffer.subarray(newlineIdx + 1);
       if (!line) continue;
       try {
-        const msg = JSON.parse(line);
-        // Forward to extension via native messaging
-        writeNativeMessage(msg);
+        writeNativeMessage(JSON.parse(line));
       } catch {
         // skip malformed
       }
     }
-  });
+    if (tcpBuffer.length > MAX_LINE_BYTES) socket.destroy();
+  };
 
-  tcpSocket.on("error", () => {
-    tcpSocket = null;
+  socket.on("data", (chunk) => {
+    tcpBuffer = Buffer.concat([tcpBuffer, chunk]);
+    drain();
   });
-
-  tcpSocket.on("close", () => {
-    tcpSocket = null;
-    if (!reconnectTimer) {
-      reconnectTimer = setInterval(() => {
-        reconnectAttempts++;
-        if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
-          // MCP server is gone — exit cleanly so we don't linger as a zombie
-          clearInterval(reconnectTimer);
-          process.exit(0);
-        }
-        if (!tcpSocket) connectTcp();
-      }, 500);
-    }
-  });
+  drain();
 }
 
 // --- Main: bridge stdin (from extension) <-> TCP (to MCP server) ---
@@ -124,8 +157,8 @@ process.stdin.on("data", (chunk) => {
   stdinBuffer = remainder;
 
   for (const msg of messages) {
-    // Forward to MCP server via TCP
-    if (tcpSocket && !tcpSocket.destroyed) {
+    // Forward to MCP server via TCP, but never to an unauthenticated peer
+    if (tcpReady && tcpSocket && !tcpSocket.destroyed) {
       tcpSocket.write(JSON.stringify(msg) + "\n");
     }
   }

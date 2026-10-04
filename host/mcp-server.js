@@ -16,6 +16,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { z } from "zod";
+import { loadOrCreateToken, serverHandshake, clientHandshake } from "./auth.js";
 
 
 const DEFAULT_PORT = 18765;
@@ -31,6 +32,18 @@ function getPort() {
 }
 
 const TCP_PORT = getPort();
+// Tool requests may wait on a permission prompt in Firefox (up to 120s there),
+// so allow comfortably more than that before giving up.
+const TOOL_TIMEOUT_MS = 180000;
+const MAX_LINE_BYTES = 64 * 1024 * 1024;
+
+let AUTH_TOKEN;
+try {
+  AUTH_TOKEN = loadOrCreateToken();
+} catch (e) {
+  process.stderr.write(`Cannot load auth token: ${e.message}\n`);
+  process.exit(1);
+}
 
 // --- Mode detection ---
 // Try to bind the port. If it's taken, switch to client mode.
@@ -49,7 +62,7 @@ const clientRequestMap = new Map();
 
 // Client mode: TCP connection to the primary
 let primarySocket = null;
-let clientBuffer = Buffer.alloc(0);
+let primaryReady = false; // true only after the primary has authenticated itself
 
 // --- sendToExtension: works in both modes ---
 
@@ -58,8 +71,8 @@ function sendToExtension(tool, args) {
     const id = String(++requestIdCounter);
     const timer = setTimeout(() => {
       pendingRequests.delete(id);
-      reject(new Error("Tool request timed out after 60s"));
-    }, 60000);
+      reject(new Error(`Tool request timed out after ${TOOL_TIMEOUT_MS / 1000}s`));
+    }, TOOL_TIMEOUT_MS);
     pendingRequests.set(id, { resolve, reject, timer, tool, args, resent: false });
 
     if (mode === "primary") {
@@ -73,10 +86,10 @@ function sendToExtension(tool, args) {
       nativeHostSocket.write(msg);
     } else {
       // Client mode: send to primary server
-      if (!primarySocket || primarySocket.destroyed) {
+      if (!primaryReady || !primarySocket || primarySocket.destroyed) {
         clearTimeout(timer);
         pendingRequests.delete(id);
-        reject(new Error("Lost connection to primary MCP server."));
+        reject(new Error("Not connected to an authenticated primary MCP server."));
         return;
       }
       const msg = JSON.stringify({ id, type: "tool_request", tool, args }) + "\n";
@@ -160,44 +173,38 @@ function processLine(line) {
 }
 
 const tcpServer = net.createServer((socket) => {
-  // Classification: wait briefly for a client_hello. If none arrives, treat as native host.
-  // Native hosts (launched by the browser) don't send data immediately on connect.
-  // Client MCP servers send client_hello immediately.
-  let classified = false;
-  let earlyBuffer = Buffer.alloc(0);
-
-  const classifyTimeout = setTimeout(() => {
-    if (!classified) {
-      classified = true;
-      setupNativeHostConnection(socket, earlyBuffer);
+  // Every connection must authenticate (HMAC challenge-response with the
+  // per-user secret) and declare its role before anything else is accepted.
+  socket.on("error", () => {});
+  serverHandshake(socket, AUTH_TOKEN, ["native", "client"], (err, info) => {
+    if (err) {
+      process.stderr.write(`Rejected unauthenticated TCP connection: ${err.message}\n`);
+      socket.destroy();
+      return;
     }
-  }, 500); // 500ms is plenty for a local client_hello
-
-  socket.on("data", function onEarlyData(chunk) {
-    if (classified) return; // Already classified, data handler was replaced
-    earlyBuffer = Buffer.concat([earlyBuffer, chunk]);
-    const newlineIdx = earlyBuffer.indexOf(10);
-    if (newlineIdx === -1) return; // No full line yet, keep buffering
-
-    const firstLine = earlyBuffer.subarray(0, newlineIdx).toString("utf-8").trim();
-    try {
-      const firstMsg = JSON.parse(firstLine);
-      if (firstMsg.type === "client_hello") {
-        classified = true;
-        clearTimeout(classifyTimeout);
-        socket.removeListener("data", onEarlyData);
-        setupClientConnection(socket, earlyBuffer.subarray(newlineIdx + 1));
-        return;
-      }
-    } catch {}
-
-    // Got data but it's not a client_hello, this is a native host
-    classified = true;
-    clearTimeout(classifyTimeout);
-    socket.removeListener("data", onEarlyData);
-    setupNativeHostConnection(socket, earlyBuffer);
+    if (info.role === "client") setupClientConnection(socket, info.rest);
+    else setupNativeHostConnection(socket, info.rest);
   });
 });
+
+// Splits newline-delimited data, dropping peers that send oversized lines.
+function makeLineReader(socket, onLine, initial = Buffer.alloc(0)) {
+  let buffer = initial;
+  const drain = () => {
+    let idx;
+    while ((idx = buffer.indexOf(10)) !== -1) {
+      const line = buffer.subarray(0, idx).toString("utf-8").trim();
+      buffer = buffer.subarray(idx + 1);
+      if (line) onLine(line);
+    }
+    if (buffer.length > MAX_LINE_BYTES) socket.destroy();
+  };
+  socket.on("data", (chunk) => {
+    buffer = Buffer.concat([buffer, chunk]);
+    drain();
+  });
+  drain();
+}
 
 function setupNativeHostConnection(socket, initialBuffer) {
   if (nativeHostSocket && !nativeHostSocket.destroyed) {
@@ -208,25 +215,10 @@ function setupNativeHostConnection(socket, initialBuffer) {
   }
 
   nativeHostSocket = socket;
-  let buffer = initialBuffer;
+  process.stderr.write("Native host connected\n");
+  makeLineReader(socket, processLine, initialBuffer);
 
-  // Process any data already in the buffer
-  let idx;
-  while ((idx = buffer.indexOf(10)) !== -1) {
-    processLine(buffer.subarray(0, idx).toString("utf-8").trim());
-    buffer = buffer.subarray(idx + 1);
-  }
-
-  socket.on("data", (chunk) => {
-    buffer = Buffer.concat([buffer, chunk]);
-    let newlineIdx;
-    while ((newlineIdx = buffer.indexOf(10)) !== -1) {
-      processLine(buffer.subarray(0, newlineIdx).toString("utf-8").trim());
-      buffer = buffer.subarray(newlineIdx + 1);
-    }
-  });
-
-  socket.on("error", () => { nativeHostSocket = null; });
+  socket.on("error", () => { if (nativeHostSocket === socket) nativeHostSocket = null; });
 
   socket.on("close", () => {
     if (nativeHostSocket === socket) nativeHostSocket = null;
@@ -258,42 +250,25 @@ function setupClientConnection(socket, initialBuffer) {
   // Send ack
   socket.write(JSON.stringify({ type: "client_ack", clientId }) + "\n");
 
-  let buffer = initialBuffer;
+  makeLineReader(socket, (line) => {
+    try {
+      const msg = JSON.parse(line);
+      if (msg.type === "tool_request" && msg.id) {
+        // Forward to native host with a prefixed ID
+        const prefixedId = `c${clientId}_${msg.id}`;
+        clientRequestMap.set(prefixedId, { clientId, originalId: msg.id });
 
-  function processClientData() {
-    let idx;
-    while ((idx = buffer.indexOf(10)) !== -1) {
-      const line = buffer.subarray(0, idx).toString("utf-8").trim();
-      buffer = buffer.subarray(idx + 1);
-      if (!line) continue;
-      try {
-        const msg = JSON.parse(line);
-        if (msg.type === "tool_request" && msg.id) {
-          // Forward to native host with a prefixed ID
-          const prefixedId = `c${clientId}_${msg.id}`;
-          clientRequestMap.set(prefixedId, { clientId, originalId: msg.id });
-
-          if (!nativeHostSocket || nativeHostSocket.destroyed) {
-            // Send error back to client
-            socket.write(JSON.stringify({ id: msg.id, type: "tool_error", error: "Browser extension is not connected." }) + "\n");
-            clientRequestMap.delete(prefixedId);
-          } else {
-            nativeHostSocket.write(JSON.stringify({ ...msg, id: prefixedId }) + "\n");
-          }
+        if (!nativeHostSocket || nativeHostSocket.destroyed) {
+          // Send error back to client
+          socket.write(JSON.stringify({ id: msg.id, type: "tool_error", error: "Browser extension is not connected." }) + "\n");
+          clientRequestMap.delete(prefixedId);
+        } else {
+          nativeHostSocket.write(JSON.stringify({ ...msg, id: prefixedId }) + "\n");
         }
-      } catch {}
-    }
-  }
+      }
+    } catch {}
+  }, initialBuffer);
 
-  // Process initial buffer
-  processClientData();
-
-  socket.on("data", (chunk) => {
-    buffer = Buffer.concat([buffer, chunk]);
-    processClientData();
-  });
-
-  socket.on("error", () => {});
   socket.on("close", () => {
     clientSockets.delete(clientId);
     // Clean up any pending client requests
@@ -311,47 +286,29 @@ function startClientMode() {
   process.stderr.write(`Port ${TCP_PORT} in use. Connecting as client to primary MCP server...\n`);
 
   function connect() {
-    primarySocket = net.createConnection(TCP_PORT, "127.0.0.1", () => {
-      process.stderr.write(`Connected to primary MCP server on :${TCP_PORT}\n`);
-      // Send handshake
-      primarySocket.write(JSON.stringify({ type: "client_hello" }) + "\n");
+    const socket = net.createConnection(TCP_PORT, "127.0.0.1", () => {
+      clientHandshake(socket, AUTH_TOKEN, "client", (err, rest) => {
+        if (err) {
+          process.stderr.write(`Primary on :${TCP_PORT} failed authentication: ${err.message}\n`);
+          socket.destroy();
+          return;
+        }
+        primaryReady = true;
+        process.stderr.write(`Connected to primary MCP server on :${TCP_PORT}\n`);
+        makeLineReader(socket, handlePrimaryLine, rest);
+      });
     });
+    primarySocket = socket;
 
-    primarySocket.on("data", (chunk) => {
-      clientBuffer = Buffer.concat([clientBuffer, chunk]);
-      let idx;
-      while ((idx = clientBuffer.indexOf(10)) !== -1) {
-        const line = clientBuffer.subarray(0, idx).toString("utf-8").trim();
-        clientBuffer = clientBuffer.subarray(idx + 1);
-        if (!line) continue;
-        try {
-          const msg = JSON.parse(line);
-          if (msg.type === "client_ack") continue;
-          if (msg.type === "error") {
-            process.stderr.write(`Primary server error: ${msg.error}\n`);
-            continue;
-          }
-          // Tool response routed back from primary
-          if (msg.id && pendingRequests.has(msg.id)) {
-            const { resolve, reject, timer } = pendingRequests.get(msg.id);
-            clearTimeout(timer);
-            pendingRequests.delete(msg.id);
-            if (msg.type === "tool_error") {
-              reject(new Error(msg.error || "Tool execution failed"));
-            } else {
-              resolve(msg.result);
-            }
-          }
-        } catch {}
-      }
-    });
-
-    primarySocket.on("error", (err) => {
+    socket.on("error", (err) => {
       process.stderr.write(`Client connection error: ${err.message}\n`);
     });
 
-    primarySocket.on("close", () => {
-      primarySocket = null;
+    socket.on("close", () => {
+      if (primarySocket === socket) {
+        primarySocket = null;
+        primaryReady = false;
+      }
       // Primary died, reject pending requests
       for (const [, { reject, timer }] of pendingRequests) {
         clearTimeout(timer);
@@ -361,6 +318,28 @@ function startClientMode() {
       // Try to reconnect after a delay (primary might restart)
       setTimeout(connect, 2000);
     });
+  }
+
+  function handlePrimaryLine(line) {
+    try {
+      const msg = JSON.parse(line);
+      if (msg.type === "client_ack") return;
+      if (msg.type === "error") {
+        process.stderr.write(`Primary server error: ${msg.error}\n`);
+        return;
+      }
+      // Tool response routed back from primary
+      if (msg.id && pendingRequests.has(msg.id)) {
+        const { resolve, reject, timer } = pendingRequests.get(msg.id);
+        clearTimeout(timer);
+        pendingRequests.delete(msg.id);
+        if (msg.type === "tool_error") {
+          reject(new Error(msg.error || "Tool execution failed"));
+        } else {
+          resolve(msg.result);
+        }
+      }
+    } catch {}
   }
 
   connect();
@@ -486,7 +465,7 @@ server.tool(
 // 3. navigate
 server.tool(
   "navigate",
-  'Navigate to a URL, or go forward/back in browser history. If you don\'t have a valid tab ID, use tabs_context_mcp first to get available tabs.',
+  'Navigate to a URL, or go forward/back in browser history. Only http(s) URLs are allowed. The first visit to a site may ask the user for permission; if permission is denied, do not retry. If you don\'t have a valid tab ID, use tabs_context_mcp first to get available tabs.',
   {
     url: z.string().describe('The URL to navigate to. Can be provided with or without protocol (defaults to https://). Use "forward" to go forward in history or "back" to go back in history.'),
     tabId: z.number().describe("Tab ID to navigate. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
@@ -576,7 +555,7 @@ server.tool(
 // 9. javascript_tool
 server.tool(
   "javascript_tool",
-  "Execute JavaScript code in the context of the current page. The code runs in the page's context and can interact with the DOM, window object, and page variables. Returns the result of the last expression or any thrown errors. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+  "Execute JavaScript code in the context of the current page. The code runs in the page's context and can interact with the DOM, window object, and page variables. Returns the result of the last expression or any thrown errors. The user may be asked to approve each execution. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
   {
     action: z.literal("javascript_exec").describe("Must be set to 'javascript_exec'"),
     text: z.string().describe("The JavaScript code to execute. The code will be evaluated in the page context. The result of the last expression will be returned automatically. Do NOT use 'return' statements - just write the expression you want to evaluate (e.g., 'window.myData.value' not 'return window.myData.value'). You can access and modify the DOM, call page functions, and interact with page variables."),
@@ -671,7 +650,7 @@ server.tool(
 // 17. update_plan
 server.tool(
   "update_plan",
-  "Present a plan to the user for approval before taking actions. The user will see the domains you intend to visit and your approach. Once approved, you can proceed with actions on the approved domains without additional permission prompts.",
+  "Present a plan to the user for approval before taking actions. The user sees the domains you intend to visit and your approach in an approval dialog. Once approved, you can act on the approved domains (and their subdomains) for this session without per-site permission prompts. High-risk actions (purchases, form submissions, deletions, credentials, JavaScript) still require confirmation. If the user rejects the plan, stop and ask them what to change.",
   {
     domains: z.array(z.string()).describe("List of domains you will visit (e.g., ['github.com', 'stackoverflow.com']). These domains will be approved for the session when the user accepts the plan."),
     approach: z.array(z.string()).describe("High-level description of what you will do. Focus on outcomes and key actions, not implementation details. Be concise - aim for 3-7 items."),
